@@ -14,6 +14,7 @@ import android.view.*;
 import android.view.inputmethod.EditorInfo;
 import android.widget.*;
 import org.json.*;
+import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -31,6 +32,11 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     final String[] cats = {"Potenziali clienti","Ristoranti","Bar","Hotel","Supermercati","Distributori","Farmacie","Officine","Aziende"};
     final String[] radii = {"500 m","1 km","2 km","5 km","10 km"};
+    final String[] overpassServers = {
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter"
+    };
 
     @Override public void onCreate(Bundle b) {
         super.onCreate(b);
@@ -120,8 +126,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         row.addView(right, new LinearLayout.LayoutParams(0,-2,1));
         root.addView(row);
 
-        TextView specificLabel = label("AZIENDA SPECIFICA");
-        root.addView(specificLabel);
+        root.addView(label("AZIENDA SPECIFICA"));
         companyName = new EditText(this);
         companyName.setHint("Scrivi il nome, es. Conad, Enel, Eni...");
         companyName.setHintTextColor(Color.DKGRAY);
@@ -130,14 +135,17 @@ public class MainActivity extends Activity implements SensorEventListener {
         companyName.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
         companyName.setPadding(18, 12, 18, 12);
         companyName.setBackground(whiteBox());
-        companyName.setOnEditorActionListener((v, actionId, event) -> { if (actionId == EditorInfo.IME_ACTION_SEARCH) { scanSpecific(); return true; } return false; });
+        companyName.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) { scanSpecific(); return true; }
+            return false;
+        });
         root.addView(companyName, new LinearLayout.LayoutParams(-1,-2));
 
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         buttons.setPadding(0,8,0,4);
         Button scan = new Button(this);
-        scan.setText("CERCA CATEGORIA");
+        scan.setText("CERCA ATTIVITÀ VICINE");
         scan.setOnClickListener(v -> scanCategory());
         Button specific = new Button(this);
         specific.setText("CERCA AZIENDA");
@@ -168,11 +176,14 @@ public class MainActivity extends Activity implements SensorEventListener {
                 radar.invalidate();
             };
             lm.requestLocationUpdates(LocationManager.GPS_PROVIDER,1500,3,listener);
-            if (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER,2500,10,listener);
+            if (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER))
+                lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER,2500,10,listener);
             Location x = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
             if (x == null) x = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
             if (x != null) { here = x; radar.here = x; }
-        } catch(Exception e) { status.setText("Attiva il GPS e consenti la posizione."); }
+        } catch(Exception e) {
+            status.setText("Attiva il GPS e consenti la posizione.");
+        }
     }
 
     @Override public void onRequestPermissionsResult(int r, String[] p, int[] g) {
@@ -198,46 +209,87 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     void scanCategory() {
         if (here == null) { status.setText("Sto cercando la posizione GPS…"); return; }
-        runSearch(categoryFilter(category.getSelectedItemPosition()), cats[category.getSelectedItemPosition()]);
+        int pos = category.getSelectedItemPosition();
+        runSearch(categoryFilter(pos), cats[pos]);
     }
 
     String regexEscape(String s) {
-        return s.replace("\\","\\\\").replace("\"","\\\"").replace(".","\\.").replace("[","\\[").replace("]","\\]").replace("(","\\(").replace(")","\\)").replace("?","\\?").replace("+","\\+").replace("*","\\*");
+        return s.replace("\\","\\\\").replace("\"","\\\"")
+                .replace(".","\\.").replace("[","\\[").replace("]","\\]")
+                .replace("(","\\(").replace(")","\\)").replace("?","\\?")
+                .replace("+","\\+").replace("*","\\*");
     }
 
     void scanSpecific() {
         String name = companyName.getText().toString().trim();
-        if (name.length() < 2) { status.setText("Scrivi il nome dell'azienda da cercare."); companyName.requestFocus(); return; }
+        if (name.length() < 2) {
+            status.setText("Scrivi il nome dell'azienda da cercare.");
+            companyName.requestFocus();
+            return;
+        }
         if (here == null) { status.setText("Sto cercando la posizione GPS…"); return; }
         String filter = "[\"name\"~\"" + regexEscape(name) + "\",i]";
         runSearch(filter, "Azienda: " + name);
     }
 
+    String makeQuery(String filter) {
+        double la = here.getLatitude(), lo = here.getLongitude();
+        int r = meters();
+        return "[out:json][timeout:20];(" +
+                "node"+filter+"(around:"+r+","+la+","+lo+");" +
+                "way"+filter+"(around:"+r+","+la+","+lo+");" +
+                ");out center tags;";
+    }
+
+    String callOverpass(String server, String query) throws Exception {
+        byte[] body = ("data=" + URLEncoder.encode(query, "UTF-8")).getBytes(StandardCharsets.UTF_8);
+        HttpURLConnection c = (HttpURLConnection)new URL(server).openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+        c.setRequestProperty("User-Agent", "RadarAttivita/1.3 Android");
+        c.setRequestProperty("Accept", "application/json");
+        c.setConnectTimeout(12000);
+        c.setReadTimeout(25000);
+        c.setFixedLengthStreamingMode(body.length);
+        try (OutputStream os = c.getOutputStream()) { os.write(body); }
+        int code = c.getResponseCode();
+        if (code < 200 || code >= 300) throw new IOException("HTTP " + code);
+        try (InputStream in = c.getInputStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+            return out.toString("UTF-8");
+        } finally {
+            c.disconnect();
+        }
+    }
+
     void runSearch(String filter, String label) {
         status.setText("Ricerca " + label + "…");
         new Thread(() -> {
-            try {
-                double la = here.getLatitude(), lo = here.getLongitude();
-                int r = meters();
-                String q = "[out:json][timeout:25];(node"+filter+"(around:"+r+","+la+","+lo+");way"+filter+"(around:"+r+","+la+","+lo+");relation"+filter+"(around:"+r+","+la+","+lo+"););out center tags;";
-                URL u = new URL("https://overpass-api.de/api/interpreter?data=" + URLEncoder.encode(q,"UTF-8"));
-                HttpURLConnection c = (HttpURLConnection)u.openConnection();
-                c.setRequestProperty("User-Agent","RadarAttivita/1.2");
-                c.setConnectTimeout(15000);
-                c.setReadTimeout(30000);
-                int code = c.getResponseCode();
-                if (code < 200 || code >= 300) throw new Exception("HTTP " + code);
-                String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-                ArrayList<Place> ps = parse(json);
-                runOnUiThread(() -> {
-                    radar.places = ps;
-                    radar.max = meters();
-                    radar.invalidate();
-                    status.setText(ps.size() + " risultati • tocca un punto sul radar");
-                });
-            } catch(Exception e) {
-                runOnUiThread(() -> status.setText("Ricerca non disponibile. Riprova tra poco."));
+            String lastError = "";
+            String query = makeQuery(filter);
+            for (int i=0; i<overpassServers.length; i++) {
+                try {
+                    final int serverNo = i + 1;
+                    runOnUiThread(() -> status.setText("Ricerca " + label + "… server " + serverNo));
+                    String json = callOverpass(overpassServers[i], query);
+                    ArrayList<Place> ps = parse(json);
+                    runOnUiThread(() -> {
+                        radar.places = ps;
+                        radar.max = meters();
+                        radar.invalidate();
+                        if (ps.isEmpty()) status.setText("Nessun risultato nel raggio selezionato.");
+                        else status.setText(ps.size() + " risultati • tocca un punto sul radar");
+                    });
+                    return;
+                } catch(Exception e) {
+                    lastError = e.getClass().getSimpleName() + ": " + (e.getMessage()==null ? "errore" : e.getMessage());
+                }
             }
+            final String err = lastError;
+            runOnUiThread(() -> status.setText("Connessione ai dati attività non riuscita. " + err));
         }).start();
     }
 
@@ -250,14 +302,13 @@ public class MainActivity extends Activity implements SensorEventListener {
             double la = e.optDouble("lat", Double.NaN), lo = e.optDouble("lon", Double.NaN);
             if ((Double.isNaN(la) || Double.isNaN(lo)) && e.has("center")) {
                 JSONObject center = e.getJSONObject("center");
-                la = center.optDouble("lat", Double.NaN); lo = center.optDouble("lon", Double.NaN);
+                la = center.optDouble("lat", Double.NaN);
+                lo = center.optDouble("lon", Double.NaN);
             }
             if (Double.isNaN(la) || Double.isNaN(lo)) continue;
             JSONObject tags = e.optJSONObject("tags");
             String n = "Attività";
-            if (tags != null) {
-                n = tags.optString("name", tags.optString("brand", tags.optString("operator","Attività")));
-            }
+            if (tags != null) n = tags.optString("name", tags.optString("brand", tags.optString("operator","Attività")));
             a.add(new Place(n,la,lo));
         }
         Collections.sort(a, (x,y) -> Float.compare(distanceTo(x), distanceTo(y)));
@@ -279,10 +330,19 @@ public class MainActivity extends Activity implements SensorEventListener {
         if (radar != null) radar.invalidate();
     }
     @Override public void onAccuracyChanged(Sensor s,int a) {}
-    @Override protected void onResume() { super.onResume(); if (sm!=null && rot!=null) sm.registerListener(this,rot,SensorManager.SENSOR_DELAY_UI); }
-    @Override protected void onPause() { super.onPause(); if (sm!=null) sm.unregisterListener(this); }
+    @Override protected void onResume() {
+        super.onResume();
+        if (sm!=null && rot!=null) sm.registerListener(this,rot,SensorManager.SENSOR_DELAY_UI);
+    }
+    @Override protected void onPause() {
+        super.onPause();
+        if (sm!=null) sm.unregisterListener(this);
+    }
 
-    class Place { String n; double la,lo; Place(String n,double a,double o){this.n=n;la=a;lo=o;} }
+    class Place {
+        String n; double la,lo;
+        Place(String n,double a,double o){this.n=n;la=a;lo=o;}
+    }
 
     class RadarView extends View {
         Paint p = new Paint(1);
@@ -302,7 +362,8 @@ public class MainActivity extends Activity implements SensorEventListener {
                             new AlertDialog.Builder(MainActivity.this)
                                 .setTitle(x.n)
                                 .setMessage(String.format(Locale.ITALY,"Distanza: %.0f m",distanceTo(x)))
-                                .setPositiveButton("NAVIGA",(q,w)->startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("geo:"+x.la+","+x.lo+"?q="+x.la+","+x.lo+"("+Uri.encode(x.n)+")"))))
+                                .setPositiveButton("NAVIGA",(q,w)->startActivity(new Intent(Intent.ACTION_VIEW,
+                                    Uri.parse("geo:"+x.la+","+x.lo+"?q="+x.la+","+x.lo+"("+Uri.encode(x.n)+")"))))
                                 .setNegativeButton("Chiudi",null).show();
                             return true;
                         }
@@ -318,8 +379,10 @@ public class MainActivity extends Activity implements SensorEventListener {
             p.setStyle(Paint.Style.FILL); p.setColor(Color.rgb(4,45,36)); c.drawCircle(cx,cy,R,p);
             p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(2); p.setColor(Color.rgb(20,150,110));
             for(int i=1;i<=4;i++) c.drawCircle(cx,cy,R*i/4,p);
-            c.drawLine(cx-R,cy,cx+R,cy,p); c.drawLine(cx,cy-R,cx,cy+R,p);
-            p.setStyle(Paint.Style.FILL); p.setColor(Color.WHITE); p.setTextSize(21); c.drawText("DAVANTI",cx-38,cy-R+24,p);
+            c.drawLine(cx-R,cy,cx+R,cy,p);
+            c.drawLine(cx,cy-R,cx,cy+R,p);
+            p.setStyle(Paint.Style.FILL); p.setColor(Color.WHITE); p.setTextSize(21);
+            c.drawText("DAVANTI",cx-38,cy-R+24,p);
             p.setColor(Color.YELLOW); c.drawCircle(cx,cy,10,p);
             dots.clear();
             if (here==null) return;
