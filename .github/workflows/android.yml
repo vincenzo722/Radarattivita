@@ -12,11 +12,16 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Ripristina firma debug stabile
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: radarattivita-debug-keystore-v1
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
       - run: gradle assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: RadarAttivita-v1.2
+          name: RadarAttivita-v1.3
           path: app/build/outputs/apk/debug/app-debug.apk
